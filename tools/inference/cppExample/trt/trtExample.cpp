@@ -178,19 +178,19 @@ int main(int argc, char *argv[])
     engine_file.close();
 
     // create runtime, engine, context, and stream
-    auto runtime{nvinfer1::createInferRuntime(logger)};
+    std::unique_ptr<nvinfer1::IRuntime> runtime{nvinfer1::createInferRuntime(logger)};
     if (!runtime)
     {
         std::cerr << "Failed to create runtime\n";
         return -1;
     }
-    auto engine{runtime->deserializeCudaEngine(engine_data.get(), engine_size)};
+    std::unique_ptr<nvinfer1::ICudaEngine> engine{runtime->deserializeCudaEngine(engine_data.get(), engine_size)};
     if (!engine)
     {
         std::cerr << "Failed to deserialize engine\n";
         return -1;
     }
-    auto context{engine->createExecutionContext()};
+    std::unique_ptr<nvinfer1::IExecutionContext> context{engine->createExecutionContext()};
     if (!context)
     {
         std::cerr << "Failed to create contexts\n";
@@ -211,17 +211,22 @@ int main(int argc, char *argv[])
             out_tensor_info.push_back({i, std::string(tensor_name)});
     }
 
-    // create host memory
-    size_t max_in0_size_byte = CountElement(context->getTensorShape(in_tensor_info[0].second.c_str())) * sizeof(float);
+    // create pinned host memory
+    nvinfer1::Dims in0_dims = context->getTensorShape(in_tensor_info[0].second.c_str());
+    nvinfer1::Dims out2_dims = context->getTensorShape(out_tensor_info[2].second.c_str());
+    size_t max_in0_size_byte = CountElement(in0_dims) * sizeof(float);
     size_t max_in1_size_byte = CountElement(context->getTensorShape(in_tensor_info[1].second.c_str())) * sizeof(int64_t);
     size_t max_out0_size_byte = CountElement(context->getTensorShape(out_tensor_info[0].second.c_str())) * sizeof(int64_t);
     size_t max_out1_size_byte = CountElement(context->getTensorShape(out_tensor_info[1].second.c_str())) * sizeof(float);
-    size_t max_out2_size_byte = CountElement(context->getTensorShape(out_tensor_info[2].second.c_str())) * sizeof(float);
-    std::vector<std::unique_ptr<unsigned char[]>> host_outs;
+    size_t max_out2_size_byte = CountElement(out2_dims) * sizeof(float);
+    std::vector<void *> host_ins, host_outs;
+    host_ins.resize(in_tensor_info.size());
     host_outs.resize(out_tensor_info.size());
-    host_outs[0] = std::make_unique<unsigned char[]>(max_out0_size_byte);
-    host_outs[1] = std::make_unique<unsigned char[]>(max_out1_size_byte);
-    host_outs[2] = std::make_unique<unsigned char[]>(max_out2_size_byte);
+    CUDA_CHECK(cudaMallocHost(&host_ins[0], max_in0_size_byte));
+    CUDA_CHECK(cudaMallocHost(&host_ins[1], max_in1_size_byte));
+    CUDA_CHECK(cudaMallocHost(&host_outs[0], max_out0_size_byte));
+    CUDA_CHECK(cudaMallocHost(&host_outs[1], max_out1_size_byte));
+    CUDA_CHECK(cudaMallocHost(&host_outs[2], max_out2_size_byte));
     // create cuda memory
     std::vector<void *> buffers{};
     buffers.resize(engine->getNbIOTensors());
@@ -255,7 +260,7 @@ int main(int argc, char *argv[])
         img_rows, img_cols, target_size,
         resize_rows, resize_cols, pad_rows, pad_cols, scale
     );
-    cv::Mat letterbox, blob;
+    cv::Mat letterbox;
     cv::resize(image, letterbox, cv::Size(resize_cols, resize_rows), 0, 0, cv::INTER_AREA);
     cv::copyMakeBorder(
         letterbox, letterbox,
@@ -263,6 +268,9 @@ int main(int argc, char *argv[])
         pad_cols / 2, pad_cols - pad_cols / 2,
         cv::BORDER_CONSTANT, cv::Scalar(114.0, 114.0, 114.0)
     );
+
+    const int blob_dims[4] = {1, 3, static_cast<int>(in0_dims.d[2]), static_cast<int>(in0_dims.d[3])};
+    cv::Mat blob(4, blob_dims, CV_32F, host_ins[0]);
     // no normalization
     cv::dnn::blobFromImage(letterbox, blob, 1.0f / 255.0f, cv::Size(letterbox.cols, letterbox.rows), cv::Scalar(0, 0, 0), true, false, CV_32F);
 
@@ -274,7 +282,9 @@ int main(int argc, char *argv[])
     trt_in0_dims.d[3] = letterbox.cols;
     context->setInputShape(in_tensor_info[0].second.c_str(), trt_in0_dims);
 
-    std::vector<int64_t> orig_size{static_cast<int64_t>(letterbox.rows), static_cast<int64_t>(letterbox.cols)};
+    int64_t *orig_size = static_cast<int64_t *>(host_ins[1]);
+    orig_size[0] = letterbox.cols;
+    orig_size[1] = letterbox.rows;
     trt_in1_dims.nbDims = 2;
     trt_in1_dims.d[0] = 1;
     trt_in1_dims.d[1] = 2;
@@ -282,20 +292,20 @@ int main(int argc, char *argv[])
 
     // execute
     CUDA_CHECK(cudaMemcpyAsync(buffers[0], blob.data, max_in0_size_byte, cudaMemcpyHostToDevice, *stream));
-    CUDA_CHECK(cudaMemcpyAsync(buffers[1], orig_size.data(), max_in1_size_byte, cudaMemcpyHostToDevice, *stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers[1], orig_size, max_in1_size_byte, cudaMemcpyHostToDevice, *stream));
 
     context->enqueueV3(*stream);
 
-    CUDA_CHECK(cudaMemcpyAsync(host_outs[0].get(), buffers[2], max_out0_size_byte, cudaMemcpyDeviceToHost, *stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_outs[1].get(), buffers[3], max_out1_size_byte, cudaMemcpyDeviceToHost, *stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_outs[2].get(), buffers[4], max_out2_size_byte, cudaMemcpyDeviceToHost, *stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_outs[0], buffers[2], max_out0_size_byte, cudaMemcpyDeviceToHost, *stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_outs[1], buffers[3], max_out1_size_byte, cudaMemcpyDeviceToHost, *stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_outs[2], buffers[4], max_out2_size_byte, cudaMemcpyDeviceToHost, *stream));
     CUDA_CHECK(cudaStreamSynchronize(*stream));
 
-    const int64_t *labels_ptr = reinterpret_cast<const int64_t *>(host_outs[0].get());
-    const float *boxes_ptr = reinterpret_cast<const float *>(host_outs[1].get());
-    const float *scores_ptr = reinterpret_cast<const float *>(host_outs[2].get());
+    const int64_t *labels_ptr = reinterpret_cast<const int64_t *>(host_outs[0]);
+    const float *boxes_ptr = reinterpret_cast<const float *>(host_outs[1]);
+    const float *scores_ptr = reinterpret_cast<const float *>(host_outs[2]);
 
-    size_t num_box = 300;
+    size_t num_box = static_cast<size_t>(out2_dims.d[1]);
     size_t walk = 4;
     float dw = pad_cols / 2, dh = pad_rows / 2;
     std::vector<Object> objects;
@@ -339,6 +349,12 @@ int main(int argc, char *argv[])
     for (const auto &buffer : buffers)
         if (buffer)
             CUDA_CHECK(cudaFree(buffer));
+    for (const auto &host_in : host_ins)
+        if (host_in)
+            CUDA_CHECK(cudaFreeHost(host_in));
+    for (const auto &host_out : host_outs)
+        if (host_out)
+            CUDA_CHECK(cudaFreeHost(host_out));
     if (stream && *stream)
         CUDA_CHECK(cudaStreamDestroy(*stream));
 

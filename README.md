@@ -134,6 +134,7 @@ https://github.com/user-attachments/assets/e5933d8e-3c8a-400e-870b-4e452f5321d9
 - **AP<sup>val</sup>** is evaluated on *MSCOCO val2017* dataset.
 - **Latency** is evaluated on a single T4 GPU with $batch\\_size = 1$, $fp16$, and $TensorRT==10.4.0$.
 - **Objects365+COCO** means finetuned model on *COCO* using pretrained weights trained on *Objects365*.
+- **License note:** Checkpoints trained or pretrained on Objects365 (*_obj365, *_obj2coco) may be subject to the Objects365 dataset terms and should not be assumed to be commercially cleared under the D-FINE license.
 
 
 
